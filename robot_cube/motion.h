@@ -35,26 +35,44 @@ Motor motors[4] = {
   {  18, 17, +1, 1.00f },   // 3 задний правый    — L298N №1, выход A (IN1/IN2)
 };
 
+// ================== ШИМ: ЛЮБОЕ ЯДРО ESP32 ==================
+// Ядро 3.x: ledcAttach(пин) и ledcWrite(пин). Ядро 2.x: ledcSetup(канал) + ledcAttachPin и ledcWrite(канал).
+// Версия ядра определяется при сборке, поэтому код собирается и крутит моторы на обоих.
+// У пина IN мотора i канал 2*i (IN1) или 2*i+1 (IN2) — нужен только для ядра 2.x.
+#if __has_include(<esp_arduino_version.h>)
+#include <esp_arduino_version.h>
+#endif
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+bool pwmAttach(uint8_t pin, uint8_t ch) { (void)ch; return ledcAttach(pin, PWM_FREQ, PWM_RES); }
+void pwmWrite(uint8_t pin, uint8_t ch, uint32_t duty) { (void)ch; ledcWrite(pin, duty); }
+#else
+bool pwmAttach(uint8_t pin, uint8_t ch) { ledcSetup(ch, PWM_FREQ, PWM_RES); ledcAttachPin(pin, ch); return true; }
+void pwmWrite(uint8_t pin, uint8_t ch, uint32_t duty) { (void)pin; ledcWrite(ch, duty); }
+#endif
+
 void motorWrite(int i, float s) {
   Motor& m = motors[i];
   s = constrain(s * m.dir * m.trim, -1.0f, 1.0f);
   int duty = 0;
   // lroundf, а не (int): отбрасывание дробной части занижало скважность медленных колёс на диагонали
   if (fabsf(s) > 0.02f) duty = MIN_DUTY + (int)lroundf(fabsf(s) * (255 - MIN_DUTY));
-  if (s >= 0) { ledcWrite(m.in1, duty); ledcWrite(m.in2, 0); }
-  else        { ledcWrite(m.in1, 0);    ledcWrite(m.in2, duty); }
+  if (s >= 0) { pwmWrite(m.in1, 2 * i, duty); pwmWrite(m.in2, 2 * i + 1, 0); }
+  else        { pwmWrite(m.in1, 2 * i, 0);    pwmWrite(m.in2, 2 * i + 1, duty); }
 }
 
 void motorsOff() {
-  for (int i = 0; i < 4; i++) { ledcWrite(motors[i].in1, 0); ledcWrite(motors[i].in2, 0); }
+  for (int i = 0; i < 4; i++) { pwmWrite(motors[i].in1, 2 * i, 0); pwmWrite(motors[i].in2, 2 * i + 1, 0); }
 }
 
-void motionBegin() {
+// true — все 8 пинов получили ШИМ. Если false, в мониторе будет видно, какой пин не подключился.
+bool motionBegin() {
+  bool ok = true;
   for (int i = 0; i < 4; i++) {
-    ledcAttach(motors[i].in1, PWM_FREQ, PWM_RES);   // API ядра 3.x
-    ledcAttach(motors[i].in2, PWM_FREQ, PWM_RES);
+    if (!pwmAttach(motors[i].in1, 2 * i))     { Serial.printf("[ОШИБКА] ШИМ не подключился к пину %d\n", motors[i].in1); ok = false; }
+    if (!pwmAttach(motors[i].in2, 2 * i + 1)) { Serial.printf("[ОШИБКА] ШИМ не подключился к пину %d\n", motors[i].in2); ok = false; }
   }
   motorsOff();
+  return ok;
 }
 
 // vx: вперёд(+), vy: вправо(+), w: поворот по часовой(+)

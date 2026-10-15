@@ -14,6 +14,7 @@
 
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <esp_system.h>   // esp_reset_reason(): почему плата запустилась
 #include "motion.h"
 #include "route.h"
 
@@ -79,20 +80,40 @@ void startUnload() {
   go(TO_UNLOAD);
 }
 
+void printBootInfo() {
+  esp_reset_reason_t r = esp_reset_reason();
+  const char* why = r == ESP_RST_POWERON ? "включение питания"
+                  : r == ESP_RST_EXT || r == ESP_RST_SW ? "кнопка EN / перезапуск после заливки"
+                  : r == ESP_RST_BROWNOUT ? "ПРОСАДКА ПИТАНИЯ (brownout)"
+                  : r == ESP_RST_PANIC ? "сбой программы (panic)"
+                  : "другая";
+  Serial.printf("\n[BOOT] robot_cube запущен, причина: %s (код %d)\n", why, (int)r);
+  if (r == ESP_RST_BROWNOUT)
+    Serial.println("[BOOT] Плата перезагрузилась от просадки напряжения: зарядить аккумулятор, проверить XT60 и провода питания");
+}
+
 void setup() {
   Serial.begin(115200);
-  motionBegin();
+  delay(300);
+  printBootInfo();
+  if (!motionBegin()) Serial.println("[ОШИБКА] не все моторы получили ШИМ — смотри строки выше");
 
 #if WHEEL_TEST
+  // Крутим по кругу бесконечно: тест не пропустить, если аккумулятор включили или монитор открыли позже.
   const char* WHEEL_NAMES[] = { "передний левый", "передний правый", "задний левый", "задний правый" };
-  for (int i = 0; i < 4; i++) {
-    Serial.printf("Мотор %d (%s): вперёд\n", i + 1, WHEEL_NAMES[i]);   // нумерация как в таблице пинов
-    motorWrite(i, 0.5f);
-    delay(1000);
-    motorsOff();
-    delay(700);
+  delay(2000);
+  while (true) {
+    Serial.println("\n=== WHEEL_TEST: каждое колесо должно крутиться ВПЕРЁД 1,5 с ===");
+    Serial.println("Строки идут, а колёса стоят -> питание L298N, общий GND с ESP32, перемычки ENA/ENB");
+    for (int i = 0; i < 4; i++) {
+      Serial.printf("Мотор %d (%s), IN1=%d IN2=%d: вперёд\n", i + 1, WHEEL_NAMES[i], motors[i].in1, motors[i].in2);
+      motorWrite(i, 0.8f);
+      delay(1500);
+      motorsOff();
+      delay(700);
+    }
+    delay(2000);
   }
-  while (true) delay(1000);
 #endif
 
   WiFi.mode(WIFI_STA);

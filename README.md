@@ -40,8 +40,10 @@
 
 ## Железо
 
-- Плата **ESP32 Dev Module**, Arduino IDE / `arduino-cli`, **ядро ESP32 3.x**
-  (ШИМ через `ledcAttach(pin, freq, res)` и `ledcWrite(pin, duty)`; `ledcSetup` / `ledcAttachPin` из 2.x не работают).
+- Плата **ESP32 Dev Module**, Arduino IDE / `arduino-cli`, ядро «esp32 by Espressif» **3.x или 2.x**
+  (версия определяется при сборке: на 3.x ШИМ через `ledcAttach`, на 2.x — через `ledcSetup` / `ledcAttachPin`).
+- При старте в Serial Monitor (115200) печатается `[BOOT] … причина: …`. «ПРОСАДКА ПИТАНИЯ (brownout)» значит,
+  что плата перезагружается при старте моторов: аккумулятор или провода питания.
 - Шасси с четырьмя меканум-колёсами, питание — два 18650 через XT60. От USB моторы не крутятся.
 - Драйверы моторов — два **L298N**, перемычки ENA/ENB стоят, ШИМ подаётся на входы IN.
 
