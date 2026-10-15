@@ -1,14 +1,14 @@
 // Хакатон «Довезти кубик» — основная программа
-// Плата: ESP32 Dev Module, Arduino IDE. Моторы без ШИМ: только digitalWrite.
+// Плата: ESP32 Dev Module, ядро ESP32 3.x, Arduino IDE
 //
 // Файлы проекта (в Arduino IDE это вкладки):
 //   robot_cube.ino — логика попытки и UDP (здесь работает человек на связи)
-//   motion.h       — моторы, виды движения, пересчёт метров во время (человек на движении)
+//   motion.h       — моторы, разгон, пересчёт метров во время (человек на движении)
 //   route.h        — сам маршрут, крутим на поле
 //
 // Порядок настройки на поле:
 //   1. WHEEL_TEST 1 -> каждое колесо крутится «вперёд». Неправильное -> dir = -1 в motion.h
-//   2. CALIB_TEST 1, 2, 3 -> калибруем SPEED_FWD, SPEED_SIDE, SPEED_DIAG в motion.h
+//   2. CALIB_TEST 1 и 2 -> калибруем SPEED_FWD и SPEED_SIDE в motion.h
 //   3. TUNE_STEPS 1, 2, 3... -> проверяем маршрут по кускам, подгоняем k в route.h
 //   4. Все режимы в 0 -> полный прогон
 
@@ -22,7 +22,7 @@
 
 // ================== РЕЖИМЫ ОТЛАДКИ ==================
 #define WHEEL_TEST 0   // 1 = проверка направления колёс
-#define CALIB_TEST 0   // 1 = «2 м вперёд», 2 = «2 м вбок вправо», 3 = «2 м по диагонали вперёд-вправо», затем стоп
+#define CALIB_TEST 0   // 1 = «2 м вперёд», 2 = «2 м вбок вправо», затем стоп
 #define TUNE_STEPS 0   // N > 0 = проехать только первые N отрезков ROUTE_TO_ARM и стоп
 
 // ================== СВЯЗЬ ==================
@@ -35,7 +35,7 @@ const uint16_t  LOCAL_PORT = 4210;   // ответ придёт на адрес 
 const uint32_t START_DELAY_MS  = 3000;   // пауза после включения питания: успеть убрать руки
 const uint32_t LOAD_RETRY_MS   = 3000;   // по ТЗ: нет STARTED за 3 с -> LOAD снова
 const uint32_t DONE_TIMEOUT_MS = 30000;  // по ТЗ: ждём DONE не дольше 30 с
-const uint32_t WIFI_KICK_MS    = 10000;  // стоим у манипулятора без Wi-Fi столько -> подключаемся заново
+const uint32_t WIFI_KICK_MS    = 20000;  // нет Wi-Fi столько после начала подключения -> подключаемся заново (меньше нельзя: оборвём медленное подключение)
 
 // ================== СВЕТОДИОД СОСТОЯНИЯ ==================
 // Встроенный синий светодиод ESP32 Dev Module (GPIO2): видно, что программа работает, даже без USB.
@@ -50,7 +50,7 @@ enum State { WAIT_START, TO_ARM, REQ_LOAD, WAIT_DONE, TO_UNLOAD, FINISHED };
 const char* STATE_NAMES[] = { "WAIT_START", "TO_ARM", "REQ_LOAD", "WAIT_DONE", "TO_UNLOAD", "FINISHED" };
 
 State state = WAIT_START;
-uint32_t tState = 0, lastLoad = 0, lastWifiKick = 0;
+uint32_t tState = 0, lastLoad = 0, lastTick = 0, lastWifiKick = 0;
 
 WiFiUDP udp;
 bool udpReady = false;
@@ -129,7 +129,7 @@ void setup() {
   if (STATUS_LED >= 0) pinMode(STATUS_LED, OUTPUT);
   delay(300);
   printBootInfo();
-  motionBegin();
+  if (!motionBegin()) Serial.println("[ОШИБКА] не все моторы получили ШИМ — смотри строки выше");
 
 #if WHEEL_TEST
   // Крутим по кругу бесконечно: тест не пропустить, если аккумулятор включили или монитор открыли позже.
@@ -140,7 +140,7 @@ void setup() {
     Serial.println("Строки идут, а колёса стоят -> питание L298N, общий GND с ESP32, перемычки ENA/ENB");
     for (int i = 0; i < 4; i++) {
       Serial.printf("Мотор %d (%s), IN1=%d IN2=%d: вперёд\n", i + 1, WHEEL_NAMES[i], motors[i].in1, motors[i].in2);
-      motorSet(i, +1);
+      motorWrite(i, 0.8f);
       delay(1500);
       motorsOff();
       delay(700);
@@ -149,11 +149,14 @@ void setup() {
   }
 #endif
 
+  lastTick = millis();
   go(WAIT_START);
 }
 
 void loop() {
   uint32_t now = millis();
+  float dt = (now - lastTick) / 1000.0f;
+  lastTick = now;
   statusLed(now);
 
   switch (state) {
@@ -163,8 +166,6 @@ void loop() {
         startRoute(CALIB_FWD, LEN(CALIB_FWD));
 #elif CALIB_TEST == 2
         startRoute(CALIB_SIDE, LEN(CALIB_SIDE));
-#elif CALIB_TEST == 3
-        startRoute(CALIB_DIAG, LEN(CALIB_DIAG));
 #else
         size_t n = LEN(ROUTE_TO_ARM);
         if (TUNE_STEPS > 0 && (size_t)TUNE_STEPS < n) n = TUNE_STEPS;
@@ -175,7 +176,7 @@ void loop() {
       break;
 
     case TO_ARM:
-      if (routeTick()) {
+      if (routeTick(dt)) {
         motorsOff();          // критерий «моторы выключены до отправки LOAD»
         if (CALIB_TEST || TUNE_STEPS) { go(FINISHED); break; }
         lastLoad = 0;
@@ -228,7 +229,7 @@ void loop() {
     }
 
     case TO_UNLOAD:
-      if (routeTick()) {
+      if (routeTick(dt)) {
         motorsOff();
         go(FINISHED);
       }

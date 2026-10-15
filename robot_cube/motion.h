@@ -1,141 +1,177 @@
-// motion.h — моторы и езда по маршруту БЕЗ ШИМ.
-// Каждое колесо либо крутится вперёд, либо назад, либо стоит (только digitalWrite).
+// motion.h — моторы, кинематика меканум-колёс, плавный разгон, езда по отрезкам в метрах.
 // Здесь работает человек, который отвечает за движение. Маршрут лежит отдельно в route.h.
 #pragma once
 #include <Arduino.h>
 
-// ================== КАЛИБРОВКА СКОРОСТЕЙ ==================
-// Сколько метров в секунду робот проезжает в каждом виде движения.
-// Как замерить (CALIB_TEST в robot_cube.ino), d — реально проеханное расстояние по рулетке:
-//   CALIB_TEST 1: «2 м вперёд»                  -> SPEED_FWD  = SPEED_FWD  * d / 2
-//   CALIB_TEST 2: «2 м вбок вправо»             -> SPEED_SIDE = SPEED_SIDE * d / 2
-//   CALIB_TEST 3: «2 м по диагонали вперёд-вправо», d — по прямой от старта до финиша
-//                                               -> SPEED_DIAG = SPEED_DIAG * d / 2
-// Мерить на том же полу, с заряженным аккумулятором и с теми же PULSE_ON_MS / PULSE_OFF_MS.
-const float SPEED_FWD  = 0.50f;   // м/с вперёд и назад
-const float SPEED_SIDE = 0.40f;   // м/с вбок (у меканума обычно меньше, чем вперёд)
-const float SPEED_DIAG = 0.30f;   // м/с по диагонали (крутится только одна пара колёс)
+// ================== КАЛИБРОВКА ==================
+// Как замерить (режим CALIB_TEST в robot_cube.ino):
+//   CALIB_TEST 1: робот «думает», что едет 2 м вперёд. Мерим реальное расстояние d.
+//                 SPEED_FWD = SPEED_FWD * d / 2.0
+//   CALIB_TEST 2: то же вбок -> SPEED_SIDE = SPEED_SIDE * d / 2.0
+// Мерить на том же полу и с заряженным аккумулятором.
+const float CRUISE     = 0.6f;    // команда скорости на маршруте (0..1)
+const float SPEED_FWD  = 0.50f;   // м/с вперёд при команде CRUISE
+const float SPEED_SIDE = 0.40f;   // м/с вбок при команде CRUISE (у меканума обычно меньше)
 
-// ================== СКОРОСТЬ БЕЗ ШИМ ==================
-// Мотор включается только целиком. Чтобы робот ехал медленнее, моторы работают импульсами:
-// PULSE_ON_MS включены, PULSE_OFF_MS выключены, и так по кругу.
-//   PULSE_OFF_MS = 0  -> моторы включены постоянно, полная скорость
-//   больше OFF        -> медленнее (20/20 — примерно вдвое медленнее, 20/40 — ещё медленнее)
-// Импульсы — это по сути очень медленный программный ШИМ. Если судьи и такое запрещают — PULSE_OFF_MS = 0.
-// После смены этих чисел скорости SPEED_* надо откалибровать заново.
-const uint16_t PULSE_ON_MS  = 20;
-const uint16_t PULSE_OFF_MS = 20;
-
-const uint16_t PAUSE_MS = 400;    // полная остановка между отрезками: робот успевает встать, меньше заносов
+// Драйверы — два L298N, перемычки ENA/ENB стоят (мосты всегда включены), ШИМ подаётся на IN.
+// L298N медленно переключается и съедает ~2 В, поэтому частота пониже и порог трогания повыше.
+const int   PWM_FREQ = 1000;
+const int   PWM_RES  = 8;      // скважность 0..255
+const int   MIN_DUTY = 90;     // ниже этого мотор не трогается (подобрать на поле)
+const float ACCEL    = 1.2f;   // плавность: изменение скорости в секунду
 
 #define LEN(a) (sizeof(a) / sizeof(a[0]))
 
 // ================== МОТОРЫ ==================
-// L298N №1 (задний):   IN1=18 IN2=17 IN3=16 IN4=4
+struct Motor { uint8_t in1, in2; int8_t dir; float trim; };
+// L298N №1 (задний): IN1=18 IN2=17 IN3=16 IN4=4
 // L298N №2 (передний): IN1=26 IN2=25 IN3=33 IN4=32
-// Пины менять здесь (и так же в tools/motor_test/motor_test.ino). Порядок строк не менять.
-// Если колесо в WHEEL_TEST крутится назад — dir = -1.
-struct Motor { uint8_t in1, in2; int8_t dir; };
+// Если колесо в WHEEL_TEST крутится назад — dir = -1 (или поменять провода мотора местами).
 Motor motors[4] = {
-  //  IN1 IN2 dir
-  {  26, 25, +1 },   // 0 передний левый
-  {  33, 32, +1 },   // 1 передний правый
-  {  16,  4, +1 },   // 2 задний левый
-  {  18, 17, +1 },   // 3 задний правый
+  //  IN1 IN2 dir  trim
+  {  26, 25, +1, 1.00f },   // 0 передний левый   — L298N №2, выход A (IN1/IN2)
+  {  33, 32, +1, 1.00f },   // 1 передний правый  — L298N №2, выход B (IN3/IN4)
+  {  16,  4, +1, 1.00f },   // 2 задний левый     — L298N №1, выход B (IN3/IN4)
+  {  18, 17, +1, 1.00f },   // 3 задний правый    — L298N №1, выход A (IN1/IN2)
 };
 
-// s: +1 — вперёд, -1 — назад, 0 — стоп
-void motorSet(int i, int s) {
-  const Motor& m = motors[i];
-  s *= m.dir;
-  digitalWrite(m.in1, s > 0 ? HIGH : LOW);
-  digitalWrite(m.in2, s < 0 ? HIGH : LOW);
+// ================== ШИМ: ЛЮБОЕ ЯДРО ESP32 ==================
+// Ядро 3.x: ledcAttach(пин) и ledcWrite(пин). Ядро 2.x: ledcSetup(канал) + ledcAttachPin и ledcWrite(канал).
+// Версия ядра определяется при сборке, поэтому код собирается и крутит моторы на обоих.
+// У пина IN мотора i канал 2*i (IN1) или 2*i+1 (IN2) — нужен только для ядра 2.x.
+#if __has_include(<esp_arduino_version.h>)
+#include <esp_arduino_version.h>
+#endif
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+bool pwmAttach(uint8_t pin, uint8_t ch) { (void)ch; return ledcAttach(pin, PWM_FREQ, PWM_RES); }
+void pwmWrite(uint8_t pin, uint8_t ch, uint32_t duty) { (void)ch; ledcWrite(pin, duty); }
+#else
+bool pwmAttach(uint8_t pin, uint8_t ch) { ledcSetup(ch, PWM_FREQ, PWM_RES); ledcAttachPin(pin, ch); return true; }
+void pwmWrite(uint8_t pin, uint8_t ch, uint32_t duty) { (void)pin; ledcWrite(ch, duty); }
+#endif
+
+void motorWrite(int i, float s) {
+  Motor& m = motors[i];
+  s = constrain(s * m.dir * m.trim, -1.0f, 1.0f);
+  int duty = 0;
+  // lroundf, а не (int): отбрасывание дробной части занижало скважность медленных колёс на диагонали
+  if (fabsf(s) > 0.02f) duty = MIN_DUTY + (int)lroundf(fabsf(s) * (255 - MIN_DUTY));
+  if (s >= 0) { pwmWrite(m.in1, 2 * i, duty); pwmWrite(m.in2, 2 * i + 1, 0); }
+  else        { pwmWrite(m.in1, 2 * i, 0);    pwmWrite(m.in2, 2 * i + 1, duty); }
 }
 
 void motorsOff() {
-  for (int i = 0; i < 4; i++) motorSet(i, 0);
+  for (int i = 0; i < 4; i++) { pwmWrite(motors[i].in1, 2 * i, 0); pwmWrite(motors[i].in2, 2 * i + 1, 0); }
 }
 
-void motionBegin() {
-  for (int i = 0; i < 4; i++) { pinMode(motors[i].in1, OUTPUT); pinMode(motors[i].in2, OUTPUT); }
+// true — все 8 пинов получили ШИМ. Если false, в мониторе будет видно, какой пин не подключился.
+bool motionBegin() {
+  bool ok = true;
+  for (int i = 0; i < 4; i++) {
+    if (!pwmAttach(motors[i].in1, 2 * i))     { Serial.printf("[ОШИБКА] ШИМ не подключился к пину %d\n", motors[i].in1); ok = false; }
+    if (!pwmAttach(motors[i].in2, 2 * i + 1)) { Serial.printf("[ОШИБКА] ШИМ не подключился к пину %d\n", motors[i].in2); ok = false; }
+  }
   motorsOff();
+  return ok;
 }
 
-// ================== ВИДЫ ДВИЖЕНИЯ ==================
+// vx: вперёд(+), vy: вправо(+), w: поворот по часовой(+)
+// Если робот при vy > 0 едет влево, поменяйте знак vy во всех четырёх строках.
+void drive(float vx, float vy, float w) {
+  float s[4] = {
+    vx + vy + w,   // передний левый
+    vx - vy - w,   // передний правый
+    vx - vy + w,   // задний левый
+    vx + vy - w,   // задний правый
+  };
+  float mx = 1.0f;
+  for (int i = 0; i < 4; i++) mx = fmaxf(mx, fabsf(s[i]));
+  for (int i = 0; i < 4; i++) motorWrite(i, s[i] / mx);
+}
+
+// ================== ПЛАВНЫЙ РАЗГОН ==================
+float cur[3] = {0, 0, 0}, tgt[3] = {0, 0, 0};
+
+void setTarget(float vx, float vy, float w) { tgt[0] = vx; tgt[1] = vy; tgt[2] = w; }
+
+void updateRamp(float dt) {
+  float step = ACCEL * dt;
+  for (int k = 0; k < 3; k++) cur[k] += constrain(tgt[k] - cur[k], -step, step);
+  drive(cur[0], cur[1], cur[2]);
+}
+
+bool isStopped() {
+  return fabsf(cur[0]) < 0.01f && fabsf(cur[1]) < 0.01f && fabsf(cur[2]) < 0.01f;
+}
+
+// ================== ОТРЕЗКИ В МЕТРАХ ==================
+// Отрезок задаётся смещением в системе робота: fwd — вперёд(+)/назад(-), right — вправо(+)/влево(-).
+// k — поправка времени для ручной подгонки конкретного отрезка (1.0 = без поправки).
 // Робот не поворачивается: курс всё время один и тот же, меканум едет в любую сторону.
-enum MoveType { GO_FWD, GO_BACK, GO_RIGHT, GO_LEFT, GO_FWD_RIGHT, GO_FWD_LEFT, GO_BACK_RIGHT, GO_BACK_LEFT };
+struct Seg { float fwd, right, k; };
 
-// Какое колесо куда крутится: { передний левый, передний правый, задний левый, задний правый }
-// Если при GO_RIGHT робот едет влево — поменять местами строки GO_RIGHT и GO_LEFT,
-// а также GO_FWD_RIGHT <-> GO_FWD_LEFT и GO_BACK_RIGHT <-> GO_BACK_LEFT.
-const int8_t WHEELS[8][4] = {
-  { +1, +1, +1, +1 },   // GO_FWD        вперёд
-  { -1, -1, -1, -1 },   // GO_BACK       назад
-  { +1, -1, -1, +1 },   // GO_RIGHT      вбок вправо
-  { -1, +1, +1, -1 },   // GO_LEFT       вбок влево
-  { +1,  0,  0, +1 },   // GO_FWD_RIGHT  диагональ вперёд-вправо
-  {  0, +1, +1,  0 },   // GO_FWD_LEFT   диагональ вперёд-влево
-  {  0, -1, -1,  0 },   // GO_BACK_RIGHT диагональ назад-вправо
-  { -1,  0,  0, -1 },   // GO_BACK_LEFT  диагональ назад-влево
-};
-const char* MOVE_NAMES[8] = { "вперёд", "назад", "вбок вправо", "вбок влево",
-                              "вперёд-вправо", "вперёд-влево", "назад-вправо", "назад-влево" };
-
-float moveSpeed(MoveType t) {
-  if (t == GO_FWD || t == GO_BACK) return SPEED_FWD;
-  if (t == GO_RIGHT || t == GO_LEFT) return SPEED_SIDE;
-  return SPEED_DIAG;
+// Пересчёт метров в команду и время.
+// Время = часть вперёд / скорость вперёд + часть вбок / скорость вбок.
+// Команды подобраны так, что самое нагруженное колесо крутится ровно на CRUISE,
+// поэтому прямо, вбок и по диагонали колёса работают в одном и том же режиме.
+void segToCmd(const Seg& s, float& vx, float& vy, uint32_t& ms) {
+  float t = fabsf(s.fwd) / SPEED_FWD + fabsf(s.right) / SPEED_SIDE;   // секунды
+  vx = 0; vy = 0; ms = 0;
+  if (t <= 0) return;
+  vx = s.fwd   * CRUISE / (SPEED_FWD  * t);
+  vy = s.right * CRUISE / (SPEED_SIDE * t);
+  ms = (uint32_t)(t * s.k * 1000.0f);
 }
 
-void wheelsFor(MoveType t) {
-  for (int i = 0; i < 4; i++) motorSet(i, WHEELS[t][i]);
-}
-
-// ================== МАРШРУТ ==================
-// Отрезок: вид движения, сколько метров и k — поправка для ручной подгонки (1.0 = без поправки,
-// 1.05 = ехать на 5% дольше). Время отрезка = метры / скорость этого вида движения * k.
-struct Move { MoveType type; float meters; float k; };
-
-const Move* route = nullptr;
-int routeLen = 0, routeIdx = 0;
+const Seg* route = nullptr;
+int routeLen = 0;
+int routeIdx = -1;                  // -1 — пауза перед первым отрезком, routeLen — маршрут пройден
 uint32_t stepStart = 0, stepMs = 0;
-bool pausing = false;
+float stepV[2] = {0, 0};            // команда текущего отрезка: vx, vy
 
-void beginMove() {
-  const Move& m = route[routeIdx];
-  stepMs = (uint32_t)(m.meters / moveSpeed(m.type) * m.k * 1000.0f);
+// Команда отрезка i. До начала и после конца маршрута — стоим.
+void segCmd(int i, float v[2], uint32_t& ms) {
+  v[0] = 0; v[1] = 0; ms = 0;
+  if (i >= 0 && i < routeLen) segToCmd(route[i], v[0], v[1], ms);
+}
+
+// Разгон центрирован на границе отрезков: каждая составляющая скорости начинает меняться
+// за половину своего времени разгона ДО границы и заканчивает через столько же ПОСЛЕ.
+// Недобор пути до границы и перебор после неё равны, поэтому робот проходит ровно заданные
+// метры при любом сочетании отрезков. Если начинать разгон прямо на границе, ошибки гасятся
+// только у отрезков вдоль одной оси; на зигзаге с выездом на прямую набегает ~5 см вперёд.
+// Отрезок должен быть длиннее своего разгона и торможения (при CRUISE 0.6 и ACCEL 1.2 — от ~0,5 с).
+uint32_t leadMs(float from, float to) {
+  return (uint32_t)(fabsf(to - from) / (2.0f * ACCEL) * 1000.0f);
+}
+
+void startRoute(const Seg* r, size_t n) {
+  route = r; routeLen = (int)n; routeIdx = -1;
+  float v0[2]; uint32_t ms0;
+  segCmd(0, v0, ms0);
+  stepV[0] = 0; stepV[1] = 0;
+  uint32_t a = leadMs(0, v0[0]), b = leadMs(0, v0[1]);
+  stepMs = a > b ? a : b;           // разгон в первый отрезок тоже центрирован на его начале
   stepStart = millis();
-  pausing = false;
-  Serial.printf("[ROUTE] отрезок %d: %s %.2f м, %lu мс\n",
-                routeIdx, MOVE_NAMES[m.type], m.meters, (unsigned long)stepMs);
 }
 
-void startRoute(const Move* r, size_t n) {
-  route = r; routeLen = (int)n; routeIdx = 0;
-  if (routeLen > 0) beginMove();
-}
-
-// Вызывать каждый проход loop(). true — маршрут пройден и робот стоит.
-bool routeTick() {
-  if (routeIdx >= routeLen) { motorsOff(); return true; }
-  uint32_t t = millis() - stepStart;
-  if (!pausing) {
-    if (t >= stepMs) {                       // отрезок проехан -> стоп и пауза
-      motorsOff();
-      pausing = true;
-      stepStart = millis();
-      return false;
-    }
-    // импульсы: начало каждого отрезка — с включённых моторов
-    bool on = PULSE_OFF_MS == 0 || (t % (PULSE_ON_MS + PULSE_OFF_MS)) < PULSE_ON_MS;
-    if (on) wheelsFor(route[routeIdx].type);
-    else    motorsOff();
-    return false;
-  }
-  if (t >= PAUSE_MS) {                       // пауза закончилась -> следующий отрезок
+// Вызывать каждый проход loop(). true — маршрут пройден и робот плавно остановился.
+bool routeTick(float dt) {
+  if (routeIdx < routeLen && millis() - stepStart >= stepMs) {
+    stepStart += stepMs;            // граница по расписанию, задержки loop() не накапливаются
     routeIdx++;
-    if (routeIdx >= routeLen) return true;
-    beginMove();
+    segCmd(routeIdx, stepV, stepMs);
+    if (routeIdx < routeLen)
+      Serial.printf("[ROUTE] отрезок %d: vx=%.2f vy=%.2f, %lu мс\n",
+                    routeIdx, stepV[0], stepV[1], (unsigned long)stepMs);
   }
-  return false;
+  // переход к следующему отрезку начинаем заранее, для vx и vy — каждый со своим запасом
+  float next[2]; uint32_t nextMs;
+  segCmd(routeIdx + 1, next, nextMs);
+  uint32_t e = millis() - stepStart;
+  float v[2];
+  for (int k = 0; k < 2; k++) v[k] = (e + leadMs(stepV[k], next[k]) >= stepMs) ? next[k] : stepV[k];
+  setTarget(v[0], v[1], 0);
+  updateRamp(dt);
+  return routeIdx >= routeLen && isStopped();
 }
