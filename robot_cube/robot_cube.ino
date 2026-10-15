@@ -15,6 +15,8 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <esp_system.h>   // esp_reset_reason(): почему плата запустилась
+#include "soc/soc.h"            // WRITE_PERI_REG
+#include "soc/rtc_cntl_reg.h"   // RTC_CNTL_BROWN_OUT_REG — защита от просадки питания
 #include "motion.h"
 #include "route.h"
 
@@ -34,6 +36,12 @@ const uint32_t START_DELAY_MS  = 3000;   // пауза после включен
 const uint32_t LOAD_RETRY_MS   = 3000;   // по ТЗ: нет STARTED за 3 с -> LOAD снова
 const uint32_t DONE_TIMEOUT_MS = 30000;  // по ТЗ: ждём DONE не дольше 30 с
 const uint32_t WIFI_KICK_MS    = 10000;  // стоим у манипулятора без Wi-Fi столько -> подключаемся заново
+
+// ================== СВЕТОДИОД СОСТОЯНИЯ ==================
+// Встроенный синий светодиод ESP32 Dev Module (GPIO2): видно, что программа работает, даже без USB.
+//   часто мигает — стартовая пауза 3 с | горит — едет | медленно мигает — у манипулятора | не горит — финиш
+// Если пин 2 занят мотором или светодиода на плате нет — поставить -1.
+const int STATUS_LED = 2;
 
 // ================== КОНЕЧНЫЙ АВТОМАТ: СОСТОЯНИЯ ==================
 // Объявлено выше всех функций: Arduino сам вставляет прототипы функций перед первой из них,
@@ -92,8 +100,33 @@ void printBootInfo() {
     Serial.println("[BOOT] Плата перезагрузилась от просадки напряжения: зарядить аккумулятор, проверить XT60 и провода питания");
 }
 
+void statusLed(uint32_t now) {
+  if (STATUS_LED < 0) return;
+  bool on = false;
+  switch (state) {
+    case WAIT_START: on = (now / 100) % 2; break;
+    case TO_ARM: case TO_UNLOAD: on = true; break;
+    case REQ_LOAD: case WAIT_DONE: on = (now / 500) % 2; break;
+    case FINISHED: on = false; break;
+  }
+  digitalWrite(STATUS_LED, on ? HIGH : LOW);
+}
+
+// Wi-Fi включаем только у манипулятора, когда моторы уже стоят: на старте радио и моторы
+// вместе тянут большой ток, и от аккумулятора плата может перезагрузиться.
+void wifiStart() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.println("[WIFI] подключаемся к ROBOT_ARM");
+}
+
 void setup() {
+  // Без USB, только от аккумулятора, напряжение при старте моторов проседает, и защита ESP32
+  // перезагружает плату — робот «не едет без провода». Отключаем эту защиту.
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
+  if (STATUS_LED >= 0) pinMode(STATUS_LED, OUTPUT);
   delay(300);
   printBootInfo();
   motionBegin();
@@ -116,15 +149,12 @@ void setup() {
   }
 #endif
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);   // подключается в фоне, пока робот едет
-
   go(WAIT_START);
 }
 
 void loop() {
   uint32_t now = millis();
+  statusLed(now);
 
   switch (state) {
     case WAIT_START:
@@ -150,6 +180,7 @@ void loop() {
         if (CALIB_TEST || TUNE_STEPS) { go(FINISHED); break; }
         lastLoad = 0;
         lastWifiKick = now;
+        wifiStart();
         go(REQ_LOAD);
       }
       break;
