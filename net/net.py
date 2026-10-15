@@ -5,19 +5,21 @@ port = 4210
 host = "192.168.4.1"
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(( host, port ))
+address = ( host, port )
+sock.bind(( '0.0.0.0', 8080 ))
 
 def receive_msg():
     while True:
-        sock.send(input().encode('utf-8'))
+        sock.sendto(input().encode('utf-8'), address)
     
 
 def send_msg():
     payload = ""
     commands = [ "PONG", "IDLE", "BUSY", "STARTED", "DONE" ]
     while True:
-       msg = sock.recvfrom(1024).decode("utf-8")
-       if (msg.empty()): continue
+       msg, addr = sock.recvfrom(1024)
+       msg = msg.decode('utf-8')
+       if (len(msg) == 0): continue
        payload += msg
        cmds = payload.split("\n")
        *full_cmds, last_cmd = cmds
@@ -36,5 +38,10 @@ recvt = threading.Thread(target = receive_msg)
 sendt = threading.Thread(target = send_msg)
 recvt.start()
 sendt.start()
-recvt.join()
-sendt.join()
+
+try:
+    recvt.join()
+    sendt.join()
+except KeyboardInterrupt:
+    sock.close()
+    pass
